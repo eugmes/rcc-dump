@@ -8,7 +8,7 @@ anyhow = "1.0.75"
 bitflags = "2.4.1"
 chrono = "0.4.31"
 clap = { version = "4.4.11", features = ["derive"] }
+inflate = "0.4.5"
 nom = "7.1.3"
 thiserror = "1.0.50"
-zstd = "0.13.0"
-zune-inflate = "0.2.54"
+zstd = { version = "0.13.0", features = ["experimental"] }

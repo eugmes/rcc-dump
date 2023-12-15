@@ -1,4 +1,7 @@
-use std::{collections::HashSet, io, string::FromUtf16Error};
+use std::collections::HashSet;
+use std::io::{self, Cursor, Read};
+use std::marker::PhantomData;
+use std::string::FromUtf16Error;
 
 use bitflags::bitflags;
 use chrono::{DateTime, Utc};
@@ -10,7 +13,6 @@ use nom::{
     IResult,
 };
 use thiserror::Error;
-use zune_inflate::{errors::InflateDecodeErrors, DeflateDecoder, DeflateOptions};
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -76,23 +78,27 @@ fn big_u64(input: &[u8]) -> IResult<&[u8], u64> {
 }
 
 #[derive(Debug, Clone)]
-pub enum ResourceTreeNodeData {
+pub enum ResourceTreeNodeData<'a> {
     Directory {
-        children: Vec<ResourceTreeNode>,
+        children: Vec<ResourceTreeNode<'a>>,
     },
     File {
         territory: u16,
         language: u16,
-        data: Vec<u8>,
+        raw_data_size: u32,
+        data_size: Option<usize>,
     },
 }
 
 #[derive(Debug, Clone)]
-pub struct ResourceTreeNode {
+pub struct ResourceTreeNode<'a> {
     pub name: String,
     pub hash: u32,
     pub last_modified: Option<DateTime<Utc>>,
-    pub extra_data: ResourceTreeNodeData,
+    pub extra_data: ResourceTreeNodeData<'a>,
+    flags: NodeFlags,
+    data_offset: Option<u32>,
+    _phantom: PhantomData<&'a RccReader<'a>>,
 }
 
 #[derive(Debug, Error)]
@@ -111,10 +117,6 @@ pub enum RccReaderError {
     InvalidDataOffset { data_offset: usize, data_len: usize },
     #[error("Directory loop detected")]
     DirectoryLoopError,
-    #[error("Zlib decode error")]
-    ZlibError(#[from] InflateDecodeErrors),
-    #[error("Decompressed size mismatch: actual size {expected}, expected {actual}")]
-    DecompressedSizeMismatch { expected: usize, actual: usize },
     #[error("Parse error")]
     ParseError,
     #[error("String decode error")]
@@ -123,6 +125,7 @@ pub enum RccReaderError {
     ZstdDecodeError(#[from] io::Error),
 }
 
+// This has to be implemented separately to avoid leaking lifetime of the source buffer
 impl<I> From<nom::Err<nom::error::Error<I>>> for RccReaderError {
     fn from(_value: nom::Err<nom::error::Error<I>>) -> Self {
         RccReaderError::ParseError
@@ -155,14 +158,13 @@ impl<'a> RccReader<'a> {
         let names_offset = header.names_offset as usize;
         let data_offset = header.data_offset as usize;
 
-        let file_infos = rcc_file_infos(
-            format_version,
-            data.get(tree_offset..)
-                .ok_or(RccReaderError::InvalidTreeOffset {
-                    tree_offset,
-                    data_len: data.len(),
-                })?,
-        )?;
+        let input = data
+            .get(tree_offset..)
+            .ok_or(RccReaderError::InvalidTreeOffset {
+                tree_offset,
+                data_len: data.len(),
+            })?;
+        let file_infos = rcc_file_infos(format_version, input)?;
 
         Ok(Self {
             data,
@@ -172,13 +174,29 @@ impl<'a> RccReader<'a> {
         })
     }
 
-    pub fn read_file_tree(&self, include_data: bool) -> Result<ResourceTreeNode> {
-        self.read_file_tree_helper(include_data, 0, &mut HashSet::new())
+    pub fn read_file_tree(&self) -> Result<ResourceTreeNode> {
+        self.read_file_tree_helper(0, &mut HashSet::new())
+    }
+
+    pub fn get_data_stream(&self, tree_node: &ResourceTreeNode<'a>) -> Result<Box<dyn Read + 'a>> {
+        match tree_node.data_offset {
+            Some(offset) => {
+                let real_offset = self.data_offset + offset as usize;
+                let input =
+                    self.data
+                        .get(real_offset..)
+                        .ok_or(RccReaderError::InvalidNameOffset {
+                            name_offset: real_offset,
+                            data_len: self.data.len(),
+                        })?;
+                rcc_data_stream(tree_node.flags, input)
+            }
+            None => Ok(Box::new(Cursor::new(&[]))),
+        }
     }
 
     fn read_file_tree_helper(
         &self,
-        include_data: bool,
         node_index: u32,
         visited_indices: &mut HashSet<u32>,
     ) -> Result<ResourceTreeNode> {
@@ -186,12 +204,14 @@ impl<'a> RccReader<'a> {
             Err(RccReaderError::DirectoryLoopError)?
         }
         visited_indices.insert(node_index);
-        let info = &self.file_infos[node_index as usize];
+        let info = &self
+            .file_infos
+            .get(node_index as usize)
+            .expect("Internal error while indexing file_infos");
         let node_name = self.read_name(info.name_offset)?;
         let name = node_name.name.clone();
         let hash = node_name.hash;
 
-        // FIXME change the timestamp to be signed
         let last_modified = info.last_modified.and_then(|ts| {
             let secs = (ts / 1000) as i64;
             let msecs = (ts % 1000) as u32;
@@ -199,71 +219,72 @@ impl<'a> RccReader<'a> {
             DateTime::from_timestamp(secs, nsecs)
         });
 
-        let extra_data = match info.node_data {
+        let (extra_data, data_offset) = match info.node_data {
             NodeData::Directory {
                 child_count,
                 first_child_offset,
             } => {
                 let mut children = Vec::new();
                 for child in 0..child_count {
-                    children.push(self.read_file_tree_helper(
-                        include_data,
-                        first_child_offset + child,
-                        visited_indices,
-                    )?);
+                    let node_index = first_child_offset + child;
+                    let child_data = self.read_file_tree_helper(node_index, visited_indices)?;
+                    children.push(child_data);
                 }
-                ResourceTreeNodeData::Directory { children }
+                let extra_data = ResourceTreeNodeData::Directory { children };
+                (extra_data, None)
             }
             NodeData::File {
                 territory,
                 language,
                 data_offset,
             } => {
-                let data = if include_data {
-                    self.read_data(info.flags, data_offset)?
-                } else {
-                    vec![]
-                };
-                ResourceTreeNodeData::File {
+                let (raw_data_size, data_size) = self.get_data_size(info.flags, data_offset)?;
+                let extra_data = ResourceTreeNodeData::File {
                     language,
                     territory,
-                    data,
-                }
+                    raw_data_size,
+                    data_size,
+                };
+                (extra_data, Some(data_offset))
             }
         };
 
         visited_indices.remove(&node_index);
 
-        Ok(ResourceTreeNode {
+        let resource_tree_node = ResourceTreeNode {
             name,
             hash,
             last_modified,
             extra_data,
-        })
+            data_offset,
+            flags: info.flags,
+            _phantom: PhantomData,
+        };
+        Ok(resource_tree_node)
     }
 
-    fn read_data(&self, flags: NodeFlags, offset: u32) -> Result<Vec<u8>> {
+    fn get_data_size(&self, flags: NodeFlags, offset: u32) -> Result<(u32, Option<usize>)> {
         let real_offset = self.data_offset + offset as usize;
-        if real_offset >= self.data.len() {
-            Err(RccReaderError::InvalidNameOffset {
+        let input = self
+            .data
+            .get(real_offset..)
+            .ok_or(RccReaderError::InvalidNameOffset {
                 name_offset: real_offset,
                 data_len: self.data.len(),
-            })?
-        } else {
-            rcc_data(flags, &self.data[real_offset..])
-        }
+            })?;
+        rcc_data_size(flags, input)
     }
 
     fn read_name(&self, offset: u32) -> Result<RccName> {
         let real_offset = self.names_offset + offset as usize;
-        if real_offset >= self.data.len() {
-            Err(RccReaderError::InvalidDataOffset {
+        let input = self
+            .data
+            .get(real_offset..)
+            .ok_or(RccReaderError::InvalidDataOffset {
                 data_offset: real_offset,
                 data_len: self.data.len(),
-            })?
-        } else {
-            rcc_name(&self.data[real_offset..])
-        }
+            })?;
+        rcc_name(input)
     }
 }
 
@@ -283,16 +304,14 @@ fn rcc_header(input: &[u8]) -> Result<(&[u8], RccHeader)> {
         (input, None)
     };
 
-    Ok((
-        input,
-        RccHeader {
-            format_version,
-            tree_offset,
-            data_offset,
-            names_offset,
-            overall_flags,
-        },
-    ))
+    let rcc_header = RccHeader {
+        format_version,
+        tree_offset,
+        data_offset,
+        names_offset,
+        overall_flags,
+    };
+    Ok((input, rcc_header))
 }
 
 fn rcc_file_info(format_version: u32, input: &[u8]) -> Result<(&[u8], RccFileInfo)> {
@@ -306,24 +325,20 @@ fn rcc_file_info(format_version: u32, input: &[u8]) -> Result<(&[u8], RccFileInf
 
     let (input, node_data) = if flags.contains(NodeFlags::Directory) {
         let (input, (child_count, first_child_offset)) = tuple((big_u32, big_u32))(input)?;
-        (
-            input,
-            NodeData::Directory {
-                child_count,
-                first_child_offset,
-            },
-        )
+        let node_data = NodeData::Directory {
+            child_count,
+            first_child_offset,
+        };
+        (input, node_data)
     } else {
         let (input, (territory, language, data_offset)) =
             tuple((big_u16, big_u16, big_u32))(input)?;
-        (
-            input,
-            NodeData::File {
-                territory,
-                language,
-                data_offset,
-            },
-        )
+        let node_data = NodeData::File {
+            territory,
+            language,
+            data_offset,
+        };
+        (input, node_data)
     };
 
     let (input, last_modified) = if format_version >= 2 {
@@ -333,15 +348,13 @@ fn rcc_file_info(format_version: u32, input: &[u8]) -> Result<(&[u8], RccFileInf
         (input, None)
     };
 
-    Ok((
-        input,
-        RccFileInfo {
-            name_offset,
-            flags,
-            node_data,
-            last_modified,
-        },
-    ))
+    let rcc_file_info = RccFileInfo {
+        name_offset,
+        flags,
+        node_data,
+        last_modified,
+    };
+    Ok((input, rcc_file_info))
 }
 
 fn rcc_file_infos(format_version: u32, mut input: &[u8]) -> Result<Vec<RccFileInfo>> {
@@ -376,41 +389,39 @@ fn rcc_name(input: &[u8]) -> Result<RccName> {
     Ok(RccName { hash, name })
 }
 
-fn rcc_data(flags: NodeFlags, input: &[u8]) -> Result<Vec<u8>> {
-    let (input, size) = big_u32(input)?;
-    if size > 0 {
-        let (_input, raw_data) = take(size)(input)?;
+fn rcc_data_stream<'a>(flags: NodeFlags, input: &'a [u8]) -> Result<Box<dyn Read + 'a>> {
+    let (input, raw_data_size) = big_u32(input)?;
+    let (_input, raw_data) = take(raw_data_size)(input)?;
 
-        let data = if flags.contains(NodeFlags::CompressedZstd) {
-            // FIXME: possible ZIP bomb, only constrained by input size
-            zstd::decode_all(raw_data)?
-        } else if flags.contains(NodeFlags::Compressed) {
-            let (raw_data, expected_size) = big_u32(raw_data)?;
-            let expected_size = expected_size as usize;
-            if expected_size == 0 {
-                vec![]
-            } else {
-                // FIXME: Possible ZIP bomb, but limited to 32 bit size
-                let options = DeflateOptions::default()
-                    .set_limit(expected_size)
-                    .set_confirm_checksum(true)
-                    .set_size_hint(expected_size);
-                let mut decoder = DeflateDecoder::new_with_options(raw_data, options);
-                let uncompressed = decoder.decode_zlib()?;
-                if uncompressed.len() != expected_size {
-                    Err(RccReaderError::DecompressedSizeMismatch {
-                        actual: uncompressed.len(),
-                        expected: expected_size,
-                    })?;
-                }
-                uncompressed
-            }
+    let stream = if raw_data_size > 0 && flags.contains(NodeFlags::CompressedZstd) {
+        Box::new(zstd::Decoder::new(raw_data)?) as Box<dyn Read + 'a>
+    } else if raw_data_size > 0 && flags.contains(NodeFlags::Compressed) {
+        let (raw_data, expected_size) = big_u32(raw_data)?;
+        let expected_size = expected_size as usize;
+        if expected_size == 0 {
+            Box::new(Cursor::new(&[]))
         } else {
-            raw_data.to_owned()
-        };
-
-        Ok(data)
+            Box::new(inflate::DeflateDecoder::from_zlib(raw_data)) as Box<dyn Read + 'a>
+        }
     } else {
-        Ok(vec![])
-    }
+        Box::new(Cursor::new(raw_data))
+    };
+    Ok(stream)
+}
+
+fn rcc_data_size(flags: NodeFlags, input: &[u8]) -> Result<(u32, Option<usize>)> {
+    let (input, raw_data_size) = big_u32(input)?;
+    let (_input, raw_data) = take(raw_data_size)(input)?;
+
+    let data_size = if raw_data_size == 0 {
+        Some(0)
+    } else if flags.contains(NodeFlags::CompressedZstd) {
+        zstd::bulk::Decompressor::upper_bound(raw_data)
+    } else if flags.contains(NodeFlags::Compressed) {
+        let (_raw_data, expected_size) = big_u32(raw_data)?;
+        Some(expected_size as usize)
+    } else {
+        Some(raw_data_size as usize)
+    };
+    Ok((raw_data_size, data_size))
 }
